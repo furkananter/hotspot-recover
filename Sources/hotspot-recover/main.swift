@@ -306,7 +306,70 @@ final class Watcher {
     }
 }
 
-// MARK: - Menu bar
+// MARK: - Menu bar icon
+
+/// The app's own menu bar glyph: a phone with signal waves, plus one variant per state.
+/// Drawn in code so it stays a crisp template image at any scale without an app bundle.
+enum Glyph: CaseIterable { case wifi, usb, reconnect0, reconnect1, reconnect2, paused, off }
+
+// 18x18 pt canvas, top-left origin (flipped). Phone on the left, signal on the right.
+func drawGlyph(_ g: Glyph, color: NSColor) {
+    let lw: CGFloat = 1.5
+    color.setStroke(); color.setFill()
+    // Phone body
+    let phone = NSBezierPath(roundedRect: NSRect(x: 2.5, y: 2.25, width: 6.5, height: 13.5), xRadius: 2, yRadius: 2)
+    phone.lineWidth = lw; phone.stroke()
+    // Home indicator
+    let bar = NSBezierPath(); bar.move(to: NSPoint(x: 4.9, y: 13.1)); bar.line(to: NSPoint(x: 6.6, y: 13.1))
+    bar.lineWidth = 1.1; bar.lineCapStyle = .round; bar.stroke()
+
+    func arc(_ r: CGFloat, alpha: CGFloat) {
+        let p = NSBezierPath()
+        // flipped coords: angles measured clockwise visually; -40..40 points right
+        p.appendArc(withCenter: NSPoint(x: 8.6, y: 9), radius: r, startAngle: -42, endAngle: 42)
+        p.lineWidth = lw; p.lineCapStyle = .round
+        color.withAlphaComponent(alpha).setStroke(); p.stroke()
+        color.setStroke()
+    }
+    switch g {
+    case .wifi: arc(3.6, alpha: 1); arc(6.9, alpha: 1)
+    case .reconnect0: arc(3.6, alpha: 0.3); arc(6.9, alpha: 0.3)
+    case .reconnect1: arc(3.6, alpha: 1); arc(6.9, alpha: 0.3)
+    case .reconnect2: arc(3.6, alpha: 1); arc(6.9, alpha: 1)
+    case .off:
+        arc(3.6, alpha: 0.3); arc(6.9, alpha: 0.3)
+        let s = NSBezierPath(); s.move(to: NSPoint(x: 11.6, y: 4.6)); s.line(to: NSPoint(x: 16.4, y: 13.4))
+        s.lineWidth = lw; s.lineCapStyle = .round; s.stroke()
+    case .paused:
+        for x in [12.6, 15.6] as [CGFloat] {
+            let b = NSBezierPath(); b.move(to: NSPoint(x: x, y: 6)); b.line(to: NSPoint(x: x, y: 12))
+            b.lineWidth = 1.7; b.lineCapStyle = .round; b.stroke()
+        }
+    case .usb:
+        // cable leaves the phone's right edge and ends in a plug
+        let c = NSBezierPath()
+        c.move(to: NSPoint(x: 9.75, y: 11.6))
+        c.curve(to: NSPoint(x: 14, y: 7.5), controlPoint1: NSPoint(x: 12.5, y: 11.5), controlPoint2: NSPoint(x: 14, y: 10.5))
+        c.lineWidth = 1.3; c.lineCapStyle = .round; c.stroke()
+        NSBezierPath(roundedRect: NSRect(x: 12.3, y: 3.6, width: 3.4, height: 4.2), xRadius: 0.8, yRadius: 0.8).fill()
+        for x in [13.2, 14.8] as [CGFloat] {
+            let pr = NSBezierPath(); pr.move(to: NSPoint(x: x, y: 3.6)); pr.line(to: NSPoint(x: x, y: 2))
+            pr.lineWidth = 0.9; pr.stroke()
+        }
+    }
+}
+
+func glyphImage(_ g: Glyph, description: String) -> NSImage {
+    let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+        drawGlyph(g, color: .black)
+        return true
+    }
+    image.isTemplate = true
+    image.accessibilityDescription = description
+    return image
+}
+
+// MARK: - Menu
 
 final class MenuController: NSObject, NSMenuDelegate {
     private let watcher: Watcher
@@ -318,7 +381,8 @@ final class MenuController: NSObject, NSMenuDelegate {
     private let reconnectItem = NSMenuItem(title: "Reconnect Now", action: #selector(reconnect), keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "Pause Auto-Reconnect", action: #selector(togglePause), keyEquivalent: "")
     private let alwaysItem = NSMenuItem(title: "Reconnect After Restart", action: #selector(toggleAlways), keyEquivalent: "")
-    private var shownSymbol: String?
+    private var shownGlyph: Glyph?
+    private var animation: Timer?
 
     init(watcher: Watcher, defaults: UserDefaults) {
         self.watcher = watcher
@@ -342,14 +406,14 @@ final class MenuController: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) { refresh() }
 
     private func refresh() {
-        let (text, symbol): (String, String)
+        let text: String, glyph: Glyph
         switch watcher.status {
-        case .wifi: (text, symbol) = ("Connected over Wi-Fi", "personalhotspot")
-        case .usb: (text, symbol) = ("Connected over USB", "cable.connector")
-        case .reconnecting: (text, symbol) = ("Reconnecting…", "arrow.triangle.2.circlepath")
-        case .paused: (text, symbol) = ("Paused", "pause.circle")
-        case .notOnHotspot: (text, symbol) = ("Not on hotspot", "personalhotspot.slash")
-        case .wifiOff: (text, symbol) = ("Wi-Fi is off", "personalhotspot.slash")
+        case .wifi: (text, glyph) = ("Connected over Wi-Fi", .wifi)
+        case .usb: (text, glyph) = ("Connected over USB", .usb)
+        case .reconnecting: (text, glyph) = ("Reconnecting…", .reconnect0)
+        case .paused: (text, glyph) = ("Paused", .paused)
+        case .notOnHotspot: (text, glyph) = ("Not on hotspot", .off)
+        case .wifiOff: (text, glyph) = ("Wi-Fi is off", .off)
         }
         statusLine.title = text
         if let r = watcher.lastRecovery {
@@ -364,12 +428,32 @@ final class MenuController: NSObject, NSMenuDelegate {
         reconnectItem.isEnabled = watcher.canReconnect
         pauseItem.state = watcher.paused ? .on : .off
         alwaysItem.state = watcher.always ? .on : .off
-        if symbol != shownSymbol {
-            shownSymbol = symbol
-            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: text)
-            image?.isTemplate = true
-            statusItem.button?.image = image
+        if glyph == .reconnect0 { startAnimation(text) } else { stopAnimation(); show(glyph, text) }
+    }
+
+    private func show(_ glyph: Glyph, _ text: String) {
+        guard glyph != shownGlyph else { return }
+        shownGlyph = glyph
+        statusItem.button?.image = glyphImage(glyph, description: text)
+    }
+
+    /// Light the waves one after another while reconnecting, like the Wi-Fi menu does.
+    private func startAnimation(_ text: String) {
+        guard animation == nil else { return }
+        var frame = 0
+        let frames: [Glyph] = [.reconnect0, .reconnect1, .reconnect2]
+        show(frames[0], text)
+        let t = Timer(timeInterval: 0.35, repeats: true) { [weak self] _ in
+            frame = (frame + 1) % frames.count
+            self?.show(frames[frame], text)
         }
+        RunLoop.main.add(t, forMode: .common)
+        animation = t
+    }
+
+    private func stopAnimation() {
+        animation?.invalidate()
+        animation = nil
     }
 
     @objc private func reconnect() { watcher.reconnectNow() }

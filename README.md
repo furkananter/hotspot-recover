@@ -49,15 +49,9 @@ It stays out of the way when:
 
 ## Menu bar
 
-The agent shows an icon in the menu bar. The icon shows the state:
+The agent shows its own icon in the menu bar: a phone sending signal. It changes with the state, and the waves light up in turn while it reconnects.
 
-| Icon | State |
-| --- | --- |
-| `personalhotspot` | Connected over Wi-Fi |
-| `cable.connector` | Connected over USB |
-| `arrow.triangle.2.circlepath` | Reconnecting |
-| `pause.circle` | Auto-reconnect paused |
-| `personalhotspot.slash` | Not on the hotspot, or Wi-Fi is off |
+![Menu bar icon states: Wi-Fi, USB cable, Reconnecting, Paused, Off hotspot](docs/menu-icons.png)
 
 The menu has:
 
@@ -119,7 +113,7 @@ One line per event. The file is readable only by your user.
 - **No shell.** `networksetup` is launched by absolute path with an argument array, so a network name cannot inject commands.
 - **Only your own devices.** The phone is found through Instant Hotspot, which lists devices signed in to your Apple Account.
 - **No extra permissions.** It does not ask for Accessibility, Location, or Full Disk Access. The menu bar icon needs no permission either.
-- **No dependencies.** One Swift file, about 440 lines. Read it before you run it.
+- **No dependencies.** One Swift file, about 530 lines. Read it before you run it.
 
 If you find a security problem, please open an issue.
 
