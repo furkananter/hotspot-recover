@@ -75,11 +75,13 @@ final class Recovery: NSObject {
     var elapsed: TimeInterval { Date().timeIntervalSince(started) }
     private let interface: String
     private let deviceName: String?
+    private let manual: Bool
     private let completion: (Bool) -> Void
 
-    init(interface: String, deviceName: String?, completion: @escaping (Bool) -> Void) {
+    init(interface: String, deviceName: String?, manual: Bool = false, completion: @escaping (Bool) -> Void) {
         self.interface = interface
         self.deviceName = deviceName
+        self.manual = manual
         self.completion = completion
     }
 
@@ -136,10 +138,16 @@ final class Recovery: NSObject {
         log("hotspot enabled (\"\(ssid)\")")
         phase = .joining
         timer?.invalidate()
-        let iface = interface
+        let iface = interface, manual = self.manual
         DispatchQueue.global().async {
             var out = ""
             for attempt in 1...3 {
+                // macOS may have auto-joined another network since the drop. Never pull the Mac
+                // off it automatically; only a manual "Reconnect Now" may switch networks.
+                if !manual, let ip = ipv4(of: iface), !isHotspotAddress(ip) {
+                    out = "Wi-Fi joined another network, leaving it alone"
+                    break
+                }
                 out = joinNetwork(interface: iface, ssid: ssid, password: password)
                 if out.isEmpty { break }
                 if attempt < 3 { sleep(3) }
@@ -270,19 +278,19 @@ final class Watcher {
         let eligible = wasOnHotspot || (always && Date().timeIntervalSince(since) >= 10)
         guard noIPPolls >= 2, eligible, !paused, now >= nextAttempt, now >= graceUntil else { return }
         log("connection drop detected on \(name), recovering")
-        startRecovery(on: name)
+        startRecovery(on: name, manual: false)
     }
 
     /// Menu "Reconnect Now": one recovery right away, same bookkeeping as an automatic one.
     func reconnectNow() {
         guard !recovering, let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName, wifi.powerOn() else { return }
         log("manual reconnect on \(name)")
-        startRecovery(on: name)
+        startRecovery(on: name, manual: true)
     }
 
-    private func startRecovery(on name: String) {
+    private func startRecovery(on name: String, manual: Bool) {
         recovering = true
-        let r = Recovery(interface: name, deviceName: deviceName) { [self] ok in
+        let r = Recovery(interface: name, deviceName: deviceName, manual: manual) { [self] ok in
             let rec = current
             recovering = false
             current = nil
@@ -506,7 +514,7 @@ if once {
         log("Wi-Fi interface not found or powered off")
         exit(1)
     }
-    let r = Recovery(interface: name, deviceName: deviceName) { ok in exit(ok ? 0 : 1) }
+    let r = Recovery(interface: name, deviceName: deviceName, manual: true) { ok in exit(ok ? 0 : 1) }
     r.start()
     RunLoop.main.run()
 } else {
