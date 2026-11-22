@@ -1,5 +1,6 @@
 import Foundation
 import CoreWLAN
+import AppKit
 import ObjectiveC
 
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -70,6 +71,8 @@ final class Recovery: NSObject {
     private var session: NSObject?
     private var timer: Timer?
     private var started = Date()
+    private(set) var failure: String?
+    var elapsed: TimeInterval { Date().timeIntervalSince(started) }
     private let interface: String
     private let deviceName: String?
     private let completion: (Bool) -> Void
@@ -95,9 +98,12 @@ final class Recovery: NSObject {
 
     private func arm(_ seconds: TimeInterval, _ reason: String) {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+        // .common so the timeout still fires while a menu is open (event-tracking run loop mode).
+        let t = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
             self?.finish(reason)
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     @objc(session:updatedFoundDevices:)
@@ -167,6 +173,7 @@ final class Recovery: NSObject {
         session?.perform(NSSelectorFromString("setDelegate:"), with: nil)
         session?.perform(NSSelectorFromString("stopBrowsing"))
         session = nil
+        self.failure = failure
         if let failure { log("recovery failed: \(failure)") }
         completion(failure == nil)
     }
@@ -176,7 +183,7 @@ final class Recovery: NSObject {
 
 final class Watcher {
     private let deviceName: String?
-    private let always: Bool
+    var always: Bool
     private enum Link { case unknown, hotspot, other }  // last network the Mac was on
     private var lastWifi = Link.unknown
     private var onCable = false
@@ -191,12 +198,39 @@ final class Watcher {
     private let grace: TimeInterval = 10
     private let backoff: [TimeInterval] = [5, 10, 20, 40, 60]
 
+    enum Status { case wifi, usb, reconnecting, notOnHotspot, wifiOff, paused }
+    var onChange: (() -> Void)?
+    var paused = false { didSet { notify() } }
+    private(set) var lastRecovery: (date: Date, seconds: TimeInterval, failure: String?)?
+    private var wifiOn = true
+    private var onHotspotWifi = false
+    private var lastNotified: Status?
+
+    var status: Status {
+        if recovering { return .reconnecting }
+        if paused { return .paused }
+        if !wifiOn { return .wifiOff }
+        if onHotspotWifi { return .wifi }
+        if onCable { return .usb }
+        return .notOnHotspot
+    }
+
+    var canReconnect: Bool { !recovering && wifiOn }
+
+    private func notify(force: Bool = false) {
+        let s = status
+        guard force || s != lastNotified else { return }
+        lastNotified = s
+        onChange?()
+    }
+
     init(deviceName: String?, always: Bool) {
         self.deviceName = deviceName
         self.always = always
     }
 
     func tick() {
+        defer { notify() }
         // After a wake from sleep (timers don't fire while asleep) or a Wi-Fi off->on toggle,
         // give macOS time to auto-join whatever network is nearby before grabbing the hotspot.
         let now = Date()
@@ -204,9 +238,12 @@ final class Watcher {
         lastTick = now
         guard !recovering else { return }
         guard let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName, wifi.powerOn() else {
+            wifiOn = false; onHotspotWifi = false
             noIPPolls = 0; noIPSince = nil; graceUntil = now.addingTimeInterval(grace); return
         }
+        wifiOn = true
         let wifiIP = ipv4(of: name)
+        onHotspotWifi = wifiIP.map(isHotspotAddress) ?? false
         let cable = cableTethered(wifi: name)
         if cable != onCable {
             onCable = cable
@@ -231,15 +268,29 @@ final class Watcher {
         let since = noIPSince ?? Date()
         noIPSince = since
         let eligible = wasOnHotspot || (always && Date().timeIntervalSince(since) >= 10)
-        guard noIPPolls >= 2, eligible, now >= nextAttempt, now >= graceUntil else { return }
+        guard noIPPolls >= 2, eligible, !paused, now >= nextAttempt, now >= graceUntil else { return }
         log("connection drop detected on \(name), recovering")
+        startRecovery(on: name)
+    }
+
+    /// Menu "Reconnect Now": one recovery right away, same bookkeeping as an automatic one.
+    func reconnectNow() {
+        guard !recovering, let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName, wifi.powerOn() else { return }
+        log("manual reconnect on \(name)")
+        startRecovery(on: name)
+    }
+
+    private func startRecovery(on name: String) {
         recovering = true
         let r = Recovery(interface: name, deviceName: deviceName) { [self] ok in
+            let rec = current
             recovering = false
             current = nil
+            lastRecovery = (Date(), rec?.elapsed ?? 0, ok ? nil : rec?.failure ?? "unknown")
             if ok {
                 failures = 0
                 lastWifi = .hotspot
+                onHotspotWifi = true
             } else {
                 nextAttempt = Date().addingTimeInterval(backoff[min(failures, backoff.count - 1)])
                 failures += 1
@@ -247,20 +298,102 @@ final class Watcher {
             }
             noIPPolls = 0
             noIPSince = nil
+            notify(force: true)
         }
         current = r
+        notify()
         r.start()
     }
+}
+
+// MARK: - Menu bar
+
+final class MenuController: NSObject, NSMenuDelegate {
+    private let watcher: Watcher
+    private let defaults: UserDefaults
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let menu = NSMenu()
+    private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let lastLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let reconnectItem = NSMenuItem(title: "Reconnect Now", action: #selector(reconnect), keyEquivalent: "")
+    private let pauseItem = NSMenuItem(title: "Pause Auto-Reconnect", action: #selector(togglePause), keyEquivalent: "")
+    private let alwaysItem = NSMenuItem(title: "Reconnect After Restart", action: #selector(toggleAlways), keyEquivalent: "")
+    private var shownSymbol: String?
+
+    init(watcher: Watcher, defaults: UserDefaults) {
+        self.watcher = watcher
+        self.defaults = defaults
+        super.init()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        statusLine.isEnabled = false
+        lastLine.isEnabled = false
+        let show = NSMenuItem(title: "Show Log", action: #selector(showLog), keyEquivalent: "")
+        let quit = NSMenuItem(title: "Quit hotspot-recover", action: #selector(quitApp), keyEquivalent: "q")
+        for item in [reconnectItem, pauseItem, alwaysItem, show, quit] { item.target = self }
+        for item in [statusLine, lastLine, .separator(), reconnectItem, pauseItem, .separator(), alwaysItem, show, .separator(), quit] {
+            menu.addItem(item)
+        }
+        statusItem.menu = menu
+        watcher.onChange = { [weak self] in self?.refresh() }
+        refresh()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) { refresh() }
+
+    private func refresh() {
+        let (text, symbol): (String, String)
+        switch watcher.status {
+        case .wifi: (text, symbol) = ("Connected over Wi-Fi", "personalhotspot")
+        case .usb: (text, symbol) = ("Connected over USB", "cable.connector")
+        case .reconnecting: (text, symbol) = ("Reconnecting…", "arrow.triangle.2.circlepath")
+        case .paused: (text, symbol) = ("Paused", "pause.circle")
+        case .notOnHotspot: (text, symbol) = ("Not on hotspot", "personalhotspot.slash")
+        case .wifiOff: (text, symbol) = ("Wi-Fi is off", "personalhotspot.slash")
+        }
+        statusLine.title = text
+        if let r = watcher.lastRecovery {
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm"
+            lastLine.title = r.failure.map { "Last reconnect failed: \($0.prefix(60))" }
+                ?? String(format: "Last reconnect: %@ (%.1f s)", f.string(from: r.date), r.seconds)
+            lastLine.isHidden = false
+        } else {
+            lastLine.isHidden = true
+        }
+        reconnectItem.isEnabled = watcher.canReconnect
+        pauseItem.state = watcher.paused ? .on : .off
+        alwaysItem.state = watcher.always ? .on : .off
+        if symbol != shownSymbol {
+            shownSymbol = symbol
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: text)
+            image?.isTemplate = true
+            statusItem.button?.image = image
+        }
+    }
+
+    @objc private func reconnect() { watcher.reconnectNow() }
+    @objc private func togglePause() { watcher.paused.toggle(); refresh() }
+    @objc private func toggleAlways() {
+        watcher.always.toggle()
+        defaults.set(watcher.always, forKey: "always")
+        refresh()
+    }
+    @objc private func showLog() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/hotspot-recover.log"))
+    }
+    @objc private func quitApp() { exit(0) }
 }
 
 // MARK: - CLI
 
 let usage = """
-Usage: hotspot-recover [--once] [--device <name>] [--always] [--help]
+Usage: hotspot-recover [--once] [--no-menu] [--device <name>] [--always] [--help]
 
 Re-joins an iPhone Personal Hotspot when the Mac's Wi-Fi drops off it.
 
-  (no args)        watch forever
+  (no args)        menu bar icon + watch forever
+  --no-menu        watch forever without the menu bar icon
   --once           run one recovery now and exit (0 = joined)
   --device <name>  only use the hotspot device with this name (default: first found)
   --always         recover whenever Wi-Fi is on and has had no IPv4 for 10 s,
@@ -268,13 +401,14 @@ Re-joins an iPhone Personal Hotspot when the Mac's Wi-Fi drops off it.
   --help           show this help
 """
 
-var once = false, always = false
+var once = false, always = false, noMenu = false
 var deviceName: String?
 var args = CommandLine.arguments.dropFirst()
 while let a = args.popFirst() {
     switch a {
     case "--once": once = true
     case "--always": always = true
+    case "--no-menu": noMenu = true
     case "--device":
         guard let v = args.popFirst() else { print("--device needs a name\n\(usage)"); exit(64) }
         deviceName = v
@@ -290,9 +424,21 @@ if once {
     }
     let r = Recovery(interface: name, deviceName: deviceName) { ok in exit(ok ? 0 : 1) }
     r.start()
+    RunLoop.main.run()
 } else {
-    let watcher = Watcher(deviceName: deviceName, always: always)
-    Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in watcher.tick() }
-    log("watching (device: \(deviceName ?? "first found"), always: \(always))")
+    let defaults = UserDefaults(suiteName: "com.github.hotspot-recover") ?? .standard
+    if always && !noMenu { defaults.set(true, forKey: "always") }
+    let watcher = Watcher(deviceName: deviceName, always: noMenu ? always : defaults.bool(forKey: "always"))
+    // .common so the watcher keeps ticking while a menu is open (event-tracking run loop mode).
+    let ticker = Timer(timeInterval: 1, repeats: true) { _ in watcher.tick() }
+    RunLoop.main.add(ticker, forMode: .common)
+    log("watching (device: \(deviceName ?? "first found"), always: \(watcher.always), menu: \(!noMenu))")
+    if noMenu {
+        RunLoop.main.run()
+    } else {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let controller = MenuController(watcher: watcher, defaults: defaults)
+        withExtendedLifetime(controller) { app.run() }
+    }
 }
-RunLoop.main.run()

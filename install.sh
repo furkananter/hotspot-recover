@@ -36,7 +36,12 @@ $ARGS
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>$LOG</string>
     <key>StandardErrorPath</key>
@@ -48,3 +53,4 @@ PLIST_EOF
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
 echo "Installed. Log: $LOG"
+echo "After Quit in the menu bar, start it again with: launchctl kickstart gui/$UID/$LABEL"

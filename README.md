@@ -47,6 +47,29 @@ It stays out of the way when:
 - You left another network. Once Wi-Fi has been on a different network, it waits until you join the hotspot yourself again.
 - The Mac just woke from sleep or Wi-Fi was just turned on. It waits 10 seconds first, so macOS can join a known network nearby instead of the phone.
 
+## Menu bar
+
+The agent shows an icon in the menu bar. The icon shows the state:
+
+| Icon | State |
+| --- | --- |
+| `personalhotspot` | Connected over Wi-Fi |
+| `cable.connector` | Connected over USB |
+| `arrow.triangle.2.circlepath` | Reconnecting |
+| `pause.circle` | Auto-reconnect paused |
+| `personalhotspot.slash` | Not on the hotspot, or Wi-Fi is off |
+
+The menu has:
+
+- The current status and, after the first recovery, the time and result of the last one.
+- **Reconnect Now** runs one recovery immediately.
+- **Pause Auto-Reconnect** stops automatic recoveries until you turn it off or the agent restarts.
+- **Reconnect After Restart** is the `--always` behaviour, remembered between launches.
+- **Show Log** opens the log file.
+- **Quit hotspot-recover** stops the agent. It stays quit until your next login, or until you run `launchctl kickstart gui/$UID/com.github.hotspot-recover`. launchd only restarts it after a crash.
+
+Use `--no-menu` to run without the icon.
+
 ## Install
 
 Requires macOS 13 or later and the Xcode Command Line Tools (`xcode-select --install`).
@@ -73,10 +96,11 @@ Arguments given to `install.sh` are passed on to the agent, for example `./insta
 
 | Option | Effect |
 | --- | --- |
-| *(none)* | Watch forever. |
+| *(none)* | Show the menu bar icon and watch forever. |
+| `--no-menu` | Watch forever without the menu bar icon. |
 | `--once` | Run one recovery now and exit. Exit code 0 means joined. |
 | `--device <name>` | Only use the hotspot device with this name. Default: the first one found. |
-| `--always` | Recover whenever Wi-Fi is on and has had no address for 10 s, even if the agent has not seen the hotspot yet (for example right after a reboot). |
+| `--always` | Recover whenever Wi-Fi is on and has had no address for 10 s, even if the agent has not seen the hotspot yet (for example right after a reboot). Also switches on "Reconnect After Restart" in the menu. |
 | `--help` | Show usage. |
 
 ## Logs
@@ -94,8 +118,8 @@ One line per event. The file is readable only by your user.
 - **The hotspot password is never stored, logged, or put on a command line.** It is held in memory for the few seconds of a join and handed to `networksetup` over stdin, so it does not appear in `ps`.
 - **No shell.** `networksetup` is launched by absolute path with an argument array, so a network name cannot inject commands.
 - **Only your own devices.** The phone is found through Instant Hotspot, which lists devices signed in to your Apple Account.
-- **No extra permissions.** It does not ask for Accessibility, Location, or Full Disk Access.
-- **No dependencies.** One Swift file, about 300 lines. Read it before you run it.
+- **No extra permissions.** It does not ask for Accessibility, Location, or Full Disk Access. The menu bar icon needs no permission either.
+- **No dependencies.** One Swift file, about 440 lines. Read it before you run it.
 
 If you find a security problem, please open an issue.
 
