@@ -63,6 +63,24 @@ func joinNetwork(interface: String, ssid: String, password: String) -> String {
 typealias EnableReply = @convention(block) (UnsafeRawPointer?, UnsafeRawPointer?, UnsafeRawPointer?) -> Void
 typealias EnableFn = @convention(c) (AnyObject, Selector, AnyObject, EnableReply) -> Void
 
+// MARK: - Private API self-test
+
+/// Everything Recovery calls on SFRemoteHotspotSession. Checked before use, because a renamed
+/// selector would otherwise crash the app on every drop.
+let requiredSelectors = ["setDelegate:", "startBrowsing", "stopBrowsing", "enableHotspotForDevice:withCompletionHandler:"]
+
+/// The session class if this macOS still offers the private API we rely on, or a reason why not.
+func hotspotSessionClass() -> Result<NSObject.Type, HotspotAPIError> {
+    guard dlopen("/System/Library/PrivateFrameworks/Sharing.framework/Sharing", RTLD_NOW) != nil,
+          let cls = NSClassFromString("SFRemoteHotspotSession") as? NSObject.Type else {
+        return .failure(HotspotAPIError("SFRemoteHotspotSession is missing"))
+    }
+    let missing = requiredSelectors.filter { !cls.instancesRespond(to: NSSelectorFromString($0)) }
+    return missing.isEmpty ? .success(cls) : .failure(HotspotAPIError("SFRemoteHotspotSession lacks \(missing.joined(separator: ", "))"))
+}
+
+struct HotspotAPIError: Error { let reason: String; init(_ r: String) { reason = r } }
+
 // MARK: - One recovery attempt (main thread only)
 
 final class Recovery: NSObject {
@@ -86,9 +104,10 @@ final class Recovery: NSObject {
     }
 
     func start() {
-        guard dlopen("/System/Library/PrivateFrameworks/Sharing.framework/Sharing", RTLD_NOW) != nil,
-              let cls = NSClassFromString("SFRemoteHotspotSession") as? NSObject.Type else {
-            return finish("SFRemoteHotspotSession is unavailable on this macOS version")
+        let cls: NSObject.Type
+        switch hotspotSessionClass() {
+        case .success(let c): cls = c
+        case .failure(let e): return finish("not supported on this macOS: \(e.reason)")
         }
         started = Date()
         let s = cls.init()
@@ -206,7 +225,9 @@ final class Watcher {
     private let grace: TimeInterval = 10
     private let backoff: [TimeInterval] = [5, 10, 20, 40, 60]
 
-    enum Status { case wifi, usb, reconnecting, notOnHotspot, wifiOff, paused }
+    enum Status { case wifi, usb, reconnecting, notOnHotspot, wifiOff, paused, unsupported }
+    /// Set at launch when the private API is gone; auto-reconnect then stays off.
+    var unsupported: String?
     var onChange: (() -> Void)?
     var paused = false { didSet { notify() } }
     private(set) var lastRecovery: (date: Date, seconds: TimeInterval, failure: String?)?
@@ -215,6 +236,7 @@ final class Watcher {
     private var lastNotified: Status?
 
     var status: Status {
+        if unsupported != nil { return .unsupported }
         if recovering { return .reconnecting }
         if paused { return .paused }
         if !wifiOn { return .wifiOff }
@@ -223,7 +245,7 @@ final class Watcher {
         return .notOnHotspot
     }
 
-    var canReconnect: Bool { !recovering && wifiOn }
+    var canReconnect: Bool { !recovering && wifiOn && unsupported == nil }
 
     private func notify(force: Bool = false) {
         let s = status
@@ -276,14 +298,14 @@ final class Watcher {
         let since = noIPSince ?? Date()
         noIPSince = since
         let eligible = wasOnHotspot || (always && Date().timeIntervalSince(since) >= 10)
-        guard noIPPolls >= 2, eligible, !paused, now >= nextAttempt, now >= graceUntil else { return }
+        guard noIPPolls >= 2, eligible, !paused, unsupported == nil, now >= nextAttempt, now >= graceUntil else { return }
         log("connection drop detected on \(name), recovering")
         startRecovery(on: name, manual: false)
     }
 
     /// Menu "Reconnect Now": one recovery right away, same bookkeeping as an automatic one.
     func reconnectNow() {
-        guard !recovering, let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName, wifi.powerOn() else { return }
+        guard canReconnect, let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName, wifi.powerOn() else { return }
         log("manual reconnect on \(name)")
         startRecovery(on: name, manual: true)
     }
@@ -422,6 +444,7 @@ final class MenuController: NSObject, NSMenuDelegate {
         case .paused: (text, glyph) = ("Paused", .paused)
         case .notOnHotspot: (text, glyph) = ("Not on hotspot", .off)
         case .wifiOff: (text, glyph) = ("Wi-Fi is off", .off)
+        case .unsupported: (text, glyph) = ("Not supported on this macOS (see log)", .off)
         }
         statusLine.title = text
         if let r = watcher.lastRecovery {
@@ -525,6 +548,11 @@ if once {
     let ticker = Timer(timeInterval: 1, repeats: true) { _ in watcher.tick() }
     RunLoop.main.add(ticker, forMode: .common)
     log("watching (device: \(deviceName ?? "first found"), always: \(watcher.always), menu: \(!noMenu))")
+    if case .failure(let e) = hotspotSessionClass() {
+        // Stay running so the menu can say so, but never touch the private API.
+        watcher.unsupported = e.reason
+        log("auto-reconnect disabled, not supported on this macOS: \(e.reason)")
+    }
     if noMenu {
         RunLoop.main.run()
     } else {

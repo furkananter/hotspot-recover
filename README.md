@@ -113,13 +113,13 @@ One line per event. The file is readable only by your user.
 - **No shell.** `networksetup` is launched by absolute path with an argument array, so a network name cannot inject commands.
 - **Only your own devices.** The phone is found through Instant Hotspot, which lists devices signed in to your Apple Account.
 - **No extra permissions.** It does not ask for Accessibility, Location, or Full Disk Access. The menu bar icon needs no permission either.
-- **No dependencies.** One Swift file, about 530 lines. Read it before you run it.
+- **No dependencies.** One Swift file, about 560 lines. Read it before you run it.
 
 If you find a security problem, please open an issue.
 
 ## Limitations
 
-- **It uses a private Apple API.** `SFRemoteHotspotSession` is undocumented and can change or disappear in any macOS update. If that happens the agent logs the failure and does nothing else.
+- **It uses a private Apple API.** `SFRemoteHotspotSession` is undocumented and can change or disappear in any macOS update. At launch the agent checks that the class and every method it calls still exist. If anything is missing, it turns auto-reconnect off, shows "Not supported on this macOS" in the menu and logs what is missing, instead of calling into an API that is no longer there.
 - **Tested only on macOS 15.7** with one iPhone. Reports from other versions are welcome.
 - **The iPhone must be nearby**, signed in to the same Apple Account, with Bluetooth on.
 - **It needs to see the hotspot once.** Without `--always`, nothing happens after a reboot until you join the hotspot yourself.
